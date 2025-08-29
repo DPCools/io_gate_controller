@@ -1,0 +1,12 @@
+{
+  "name": "gate-controller",
+  "version": "2.0.0",
+  "description": "Gate Controller System with Tailwind CSS",
+  "scripts": {
+    "build:css": "npx tailwindcss -i ./src/css/tailwind.css -o ./public/css/styles.css",
+    "watch:css": "npx tailwindcss -i ./src/css/tailwind.css -o ./public/css/styles.css --watch"
+  },
+  "dependencies": {
+    "tailwindcss": "^3.3.3"
+  }
+}

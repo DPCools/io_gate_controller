@@ -1,0 +1,630 @@
+<?php
+/**
+ * Gate Controller System
+ * 
+ * Main application entry point
+ */
+
+// Start session
+session_start();
+
+// Load configuration
+$config = require_once __DIR__ . '/src/config.php';
+require_once __DIR__ . '/src/utils/DatabaseInitializer.php';
+require_once __DIR__ . '/src/controllers/AuthController.php';
+require_once __DIR__ . '/src/controllers/DeviceController.php';
+require_once __DIR__ . '/src/controllers/GateController.php';
+require_once __DIR__ . '/src/controllers/LogController.php';
+require_once __DIR__ . '/src/controllers/ApiController.php';
+
+use GateController\Utils\DatabaseInitializer;
+use GateController\Controllers\AuthController;
+use GateController\Controllers\DeviceController;
+use GateController\Controllers\GateController;
+use GateController\Controllers\LogController;
+use GateController\Controllers\ApiController;
+
+// Set error reporting
+$debugMode = isset($config['app']['mode']) && $config['app']['mode'] === 'debug';
+if (!$debugMode) {
+    error_reporting(0);
+    ini_set('display_errors', 0);
+} else {
+    error_reporting(E_ALL);
+    ini_set('display_errors', 1);
+}
+
+// Connect to database
+try {
+    $dbFile = $config['db']['file'];
+    $db = new PDO("sqlite:{$dbFile}");
+    $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    $db->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+} catch (PDOException $e) {
+    $debugMode = isset($config['app']['mode']) && $config['app']['mode'] === 'debug';
+    die("Database connection failed: " . ($debugMode ? $e->getMessage() : "Check configuration"));
+}
+
+// Initialize database if needed
+$initializer = new DatabaseInitializer($config, $db);
+if (!$initializer->isDatabaseInitialized()) {
+    $initializer->initializeDatabase();
+    
+    // Add a default admin user if this is first run
+    require_once __DIR__ . '/src/models/User.php';
+    $user = new \GateController\Models\User($db);
+    $defaultPassword = 'admin'; // Should be changed after first login
+    
+    if ($user->createUser([
+        'username' => 'admin',
+        'password' => $defaultPassword,
+        'role' => 'admin',
+        'name' => 'Administrator'
+    ])) {
+        // Set flash message about default user
+        $_SESSION['flash'] = [
+            'type' => 'info',
+            'message' => 'Database initialized with default admin user. Username: admin, Password: admin. Please change the password after login.'
+        ];
+    }
+}
+
+// Initialize controllers
+$authController = new AuthController($db, $config);
+$deviceController = new DeviceController($db, $config, $authController);
+$gateController = new GateController($db, $config, $authController);
+$logController = new LogController($db, $config, $authController);
+$apiController = new ApiController($db, $config, $gateController);
+
+// Simple router
+$route = $_GET['route'] ?? 'home';
+
+// Check if user is authenticated
+$isAuthenticated = $authController->isAuthenticated();
+$currentUser = $isAuthenticated ? $authController->getCurrentUser() : null;
+$isAdmin = $currentUser && $currentUser['role'] === 'admin';
+
+// Routes that don't require authentication
+$publicRoutes = ['login', 'logout'];
+
+// Redirect to login if not authenticated and trying to access protected route
+if (!$isAuthenticated && !in_array($route, $publicRoutes)) {
+    // Use base URL from config or determine dynamically
+    $baseUrl = $config['app']['base_url'] ?? '';
+    header('Location: ' . $baseUrl . '/login');
+    exit;
+}
+
+// Handle routes
+switch ($route) {
+    case 'home':
+    case 'dashboard':
+        // Dashboard
+        $stats = $logController->getDashboardStats();
+        $recentActivity = $logController->getRecentActivity(5);
+        
+        $pageTitle = 'Dashboard';
+        require __DIR__ . '/src/views/layouts/main.php';
+        require __DIR__ . '/src/views/dashboard.php';
+        break;
+        
+    case 'login':
+        // Login page
+        if ($isAuthenticated) {
+            // Use base URL from config or determine dynamically
+            $baseUrl = $config['app']['base_url'] ?? '';
+            header('Location: ' . $baseUrl . '/');
+            exit;
+        }
+        
+        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+            $username = $_POST['username'] ?? '';
+            $password = $_POST['password'] ?? '';
+            $remember = isset($_POST['remember']) && $_POST['remember'] === 'on';
+            
+            $result = $authController->login($username, $password, $remember);
+            
+            if ($result['success']) {
+                $redirect = $_SESSION['redirect_after_login'] ?? '/';
+                unset($_SESSION['redirect_after_login']);
+                header('Location: ' . $redirect);
+                exit;
+            } else {
+                $_SESSION['flash'] = [
+                    'type' => 'error',
+                    'message' => $result['message']
+                ];
+            }
+        }
+        
+        $pageTitle = 'Login';
+        require __DIR__ . '/src/views/layouts/main.php';
+        require __DIR__ . '/src/views/auth/login.php';
+        break;
+        
+    case 'logout':
+        // Logout
+        $authController->logout();
+        header('Location: /login');
+        exit;
+        break;
+        
+    case 'devices':
+        // List devices
+        $result = $deviceController->getAllDevices();
+        $devices = $result;
+        
+        $pageTitle = 'Devices';
+        require __DIR__ . '/src/views/layouts/main.php';
+        require __DIR__ . '/src/views/devices/index.php';
+        break;
+        
+    case 'device/create':
+        // Create device
+        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+            $result = $deviceController->createDevice($_POST);
+            
+            if ($result['success']) {
+                $_SESSION['flash'] = [
+                    'type' => 'success',
+                    'message' => 'Device created successfully'
+                ];
+                // Use base URL from config or determine dynamically
+            $baseUrl = $config['app']['base_url'] ?? '';
+            header('Location: ' . $baseUrl . '/devices');
+                exit;
+            } else {
+                $_SESSION['flash'] = [
+                    'type' => 'error',
+                    'message' => $result['message']
+                ];
+                $device = $_POST;
+            }
+        }
+        
+        $isEdit = false;
+        $pageTitle = 'Create Device';
+        require __DIR__ . '/src/views/layouts/main.php';
+        require __DIR__ . '/src/views/devices/form.php';
+        break;
+        
+    case 'device/edit':
+        // Edit device
+        $deviceId = $_GET['id'] ?? null;
+        
+        if (!$deviceId) {
+            // Use base URL from config or determine dynamically
+            $baseUrl = $config['app']['base_url'] ?? '';
+            header('Location: ' . $baseUrl . '/devices');
+            exit;
+        }
+        
+        $result = $deviceController->getDevice($deviceId);
+        
+        if (!$result['success']) {
+            $_SESSION['flash'] = [
+                'type' => 'error',
+                'message' => $result['message']
+            ];
+            // Use base URL from config or determine dynamically
+            $baseUrl = $config['app']['base_url'] ?? '';
+            header('Location: ' . $baseUrl . '/devices');
+            exit;
+        }
+        
+        $device = $result['device'];
+        
+        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+            $result = $deviceController->updateDevice($deviceId, $_POST);
+            
+            if ($result['success']) {
+                $_SESSION['flash'] = [
+                    'type' => 'success',
+                    'message' => 'Device updated successfully'
+                ];
+                // Use base URL from config or determine dynamically
+            $baseUrl = $config['app']['base_url'] ?? '';
+            header('Location: ' . $baseUrl . '/devices');
+                exit;
+            } else {
+                $_SESSION['flash'] = [
+                    'type' => 'error',
+                    'message' => $result['message']
+                ];
+                $device = array_merge($device, $_POST);
+            }
+        }
+        
+        $isEdit = true;
+        $pageTitle = 'Edit Device';
+        require __DIR__ . '/src/views/layouts/main.php';
+        require __DIR__ . '/src/views/devices/form.php';
+        break;
+        
+    case 'device/delete':
+        // Delete device
+        $deviceId = $_GET['id'] ?? null;
+        
+        if (!$deviceId) {
+            // Use base URL from config or determine dynamically
+            $baseUrl = $config['app']['base_url'] ?? '';
+            header('Location: ' . $baseUrl . '/devices');
+            exit;
+        }
+        
+        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+            $result = $deviceController->deleteDevice($deviceId);
+            
+            if ($result['success']) {
+                $_SESSION['flash'] = [
+                    'type' => 'success',
+                    'message' => 'Device deleted successfully'
+                ];
+            } else {
+                $_SESSION['flash'] = [
+                    'type' => 'error',
+                    'message' => $result['message']
+                ];
+            }
+        }
+        
+        header('Location: /devices');
+        exit;
+        break;
+        
+    case 'gates':
+        // List gates
+        $deviceId = $_GET['device_id'] ?? null;
+        $result = $gateController->getGates(['device_id' => $deviceId]);
+        $gates = $result['gates'];
+        
+        // Get devices for filter dropdown
+        $devices = $deviceController->getAllDevices();
+        
+        $pageTitle = 'Gates';
+        require __DIR__ . '/src/views/layouts/main.php';
+        require __DIR__ . '/src/views/gates/index.php';
+        break;
+        
+    case 'gate/create':
+        // Create gate
+        // Get devices for dropdown
+        $devices = $deviceController->getAllDevices();
+        
+        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+            $result = $gateController->createGate($_POST);
+            
+            if ($result['success']) {
+                $_SESSION['flash'] = [
+                    'type' => 'success',
+                    'message' => 'Gate created successfully'
+                ];
+                // Use base URL from config or determine dynamically
+            $baseUrl = $config['app']['base_url'] ?? '';
+            header('Location: ' . $baseUrl . '/gates');
+                exit;
+            } else {
+                $_SESSION['flash'] = [
+                    'type' => 'error',
+                    'message' => $result['message']
+                ];
+                $gate = $_POST;
+            }
+        }
+        
+        $isEdit = false;
+        $pageTitle = 'Create Gate';
+        require __DIR__ . '/src/views/layouts/main.php';
+        require __DIR__ . '/src/views/gates/form.php';
+        break;
+        
+    case 'gate/edit':
+        // Edit gate
+        $gateId = $_GET['id'] ?? null;
+        
+        if (!$gateId) {
+            // Use base URL from config or determine dynamically
+            $baseUrl = $config['app']['base_url'] ?? '';
+            header('Location: ' . $baseUrl . '/gates');
+            exit;
+        }
+        
+        $result = $gateController->getGate($gateId);
+        
+        if (!$result['success']) {
+            $_SESSION['flash'] = [
+                'type' => 'error',
+                'message' => $result['message']
+            ];
+            // Use base URL from config or determine dynamically
+            $baseUrl = $config['app']['base_url'] ?? '';
+            header('Location: ' . $baseUrl . '/gates');
+            exit;
+        }
+        
+        $gate = $result['gate'];
+        
+        // Get devices for dropdown
+        $devices = $deviceController->getAllDevices();
+        
+        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+            $result = $gateController->updateGate($gateId, $_POST);
+            
+            if ($result['success']) {
+                $_SESSION['flash'] = [
+                    'type' => 'success',
+                    'message' => 'Gate updated successfully'
+                ];
+                // Use base URL from config or determine dynamically
+            $baseUrl = $config['app']['base_url'] ?? '';
+            header('Location: ' . $baseUrl . '/gates');
+                exit;
+            } else {
+                $_SESSION['flash'] = [
+                    'type' => 'error',
+                    'message' => $result['message']
+                ];
+                $gate = array_merge($gate, $_POST);
+            }
+        }
+        
+        $isEdit = true;
+        $pageTitle = 'Edit Gate';
+        require __DIR__ . '/src/views/layouts/main.php';
+        require __DIR__ . '/src/views/gates/form.php';
+        break;
+        
+    case 'gate/delete':
+        // Delete gate
+        $gateId = $_GET['id'] ?? null;
+        
+        if (!$gateId) {
+            // Use base URL from config or determine dynamically
+            $baseUrl = $config['app']['base_url'] ?? '';
+            header('Location: ' . $baseUrl . '/gates');
+            exit;
+        }
+        
+        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+            $result = $gateController->deleteGate($gateId);
+            
+            if ($result['success']) {
+                $_SESSION['flash'] = [
+                    'type' => 'success',
+                    'message' => 'Gate deleted successfully'
+                ];
+            } else {
+                $_SESSION['flash'] = [
+                    'type' => 'error',
+                    'message' => $result['message']
+                ];
+            }
+        }
+        
+        header('Location: /gates');
+        exit;
+        break;
+        
+    case 'logs':
+        // Audit logs
+        if (!$isAuthenticated) {
+            // Use base URL from config or determine dynamically
+            $baseUrl = $config['app']['base_url'] ?? '';
+            header('Location: ' . $baseUrl . '/login');
+            exit;
+        }
+        
+        // Get filter parameters
+        $filters = [
+            'action_type' => $_GET['action_type'] ?? '',
+            'user_id' => $_GET['user_id'] ?? '',
+            'from_date' => $_GET['from_date'] ?? '',
+            'to_date' => $_GET['to_date'] ?? '',
+            'search' => $_GET['search'] ?? '',
+            'ip_address' => $_GET['ip_address'] ?? '',
+            'page' => isset($_GET['page']) ? (int)$_GET['page'] : 1
+        ];
+        
+        // Get logs
+        $result = $logController->getLogs($filters);
+        $logs = $result['logs'];
+        $pagination = $result['pagination'];
+        
+        // Get users for filter dropdown (admins only)
+        $users = [];
+        if ($isAdmin) {
+            require_once __DIR__ . '/src/models/User.php';
+            $userModel = new \GateController\Models\User($db);
+            $users = $userModel->getAllUsers();
+        }
+        
+        // Get action types for filter dropdown
+        $actionTypes = $logController->getActionTypes();
+        
+        // Track active filters
+        $activeFilters = array_filter($filters, function($value) {
+            return $value !== '' && $value !== 1; // Exclude empty and default page
+        });
+        
+        $pageTitle = 'Audit Logs';
+        require __DIR__ . '/src/views/layouts/main.php';
+        require __DIR__ . '/src/views/logs/index.php';
+        break;
+        
+    case 'api-keys':
+        // API Keys - admin only
+        if (!$isAdmin) {
+            $_SESSION['flash'] = [
+                'type' => 'error',
+                'message' => 'You do not have permission to access this page'
+            ];
+            header('Location: /');
+            exit;
+        }
+        
+        $result = $apiController->listApiKeys();
+        $apiKeys = $result['api_keys'];
+        
+        $pageTitle = 'API Keys';
+        require __DIR__ . '/src/views/layouts/main.php';
+        require __DIR__ . '/src/views/api/index.php';
+        break;
+        
+    case 'api-keys/create':
+        // Create API key - admin only
+        if (!$isAdmin) {
+            $_SESSION['flash'] = [
+                'type' => 'error',
+                'message' => 'You do not have permission to access this page'
+            ];
+            header('Location: /');
+            exit;
+        }
+        
+        $showNewApiKey = false;
+        $newApiKey = '';
+        
+        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+            $result = $apiController->createApiKey($_POST, $currentUser['id']);
+            
+            if ($result['success']) {
+                $showNewApiKey = true;
+                $newApiKey = $result['api_key'];
+                $apiKey = $_POST;
+                
+                $_SESSION['flash'] = [
+                    'type' => 'success',
+                    'message' => 'API key created successfully'
+                ];
+            } else {
+                $_SESSION['flash'] = [
+                    'type' => 'error',
+                    'message' => $result['message']
+                ];
+                $apiKey = $_POST;
+            }
+        }
+        
+        $isEdit = false;
+        $pageTitle = 'Create API Key';
+        require __DIR__ . '/src/views/layouts/main.php';
+        require __DIR__ . '/src/views/api/form.php';
+        break;
+        
+    case 'api-keys/edit':
+        // Edit API key - admin only
+        if (!$isAdmin) {
+            $_SESSION['flash'] = [
+                'type' => 'error',
+                'message' => 'You do not have permission to access this page'
+            ];
+            header('Location: /');
+            exit;
+        }
+        
+        $apiKeyId = $_GET['id'] ?? null;
+        
+        if (!$apiKeyId) {
+            // Use base URL from config or determine dynamically
+            $baseUrl = $config['app']['base_url'] ?? '';
+            header('Location: ' . $baseUrl . '/api-keys';
+            exit;
+        }
+        
+        // Get API key data
+        $result = $apiController->listApiKeys();
+        $apiKeys = $result['api_keys'];
+        
+        $apiKey = null;
+        foreach ($apiKeys as $key) {
+            if ($key['id'] == $apiKeyId) {
+                $apiKey = $key;
+                break;
+            }
+        }
+        
+        if (!$apiKey) {
+            $_SESSION['flash'] = [
+                'type' => 'error',
+                'message' => 'API key not found'
+            ];
+            // Use base URL from config or determine dynamically
+            $baseUrl = $config['app']['base_url'] ?? '';
+            header('Location: ' . $baseUrl . '/api-keys';
+            exit;
+        }
+        
+        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+            $result = $apiController->updateApiKey($apiKeyId, $_POST, $currentUser['id']);
+            
+            if ($result['success']) {
+                $_SESSION['flash'] = [
+                    'type' => 'success',
+                    'message' => 'API key updated successfully'
+                ];
+                // Use base URL from config or determine dynamically
+            $baseUrl = $config['app']['base_url'] ?? '';
+            header('Location: ' . $baseUrl . '/api-keys';
+                exit;
+            } else {
+                $_SESSION['flash'] = [
+                    'type' => 'error',
+                    'message' => $result['message']
+                ];
+                $apiKey = array_merge($apiKey, $_POST);
+            }
+        }
+        
+        $isEdit = true;
+        $showNewApiKey = false;
+        $pageTitle = 'Edit API Key';
+        require __DIR__ . '/src/views/layouts/main.php';
+        require __DIR__ . '/src/views/api/form.php';
+        break;
+        
+    case 'api-keys/delete':
+        // Delete API key - admin only
+        if (!$isAdmin) {
+            $_SESSION['flash'] = [
+                'type' => 'error',
+                'message' => 'You do not have permission to access this page'
+            ];
+            header('Location: /');
+            exit;
+        }
+        
+        $apiKeyId = $_GET['id'] ?? null;
+        
+        if (!$apiKeyId) {
+            // Use base URL from config or determine dynamically
+            $baseUrl = $config['app']['base_url'] ?? '';
+            header('Location: ' . $baseUrl . '/api-keys';
+            exit;
+        }
+        
+        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+            $result = $apiController->deleteApiKey($apiKeyId, $currentUser['id']);
+            
+            if ($result['success']) {
+                $_SESSION['flash'] = [
+                    'type' => 'success',
+                    'message' => 'API key deleted successfully'
+                ];
+            } else {
+                $_SESSION['flash'] = [
+                    'type' => 'error',
+                    'message' => $result['message']
+                ];
+            }
+        }
+        
+        header('Location: /api-keys');
+        exit;
+        break;
+        
+    default:
+        // 404 Not Found
+        http_response_code(404);
+        echo "404 Page Not Found";
+        break;
+}
